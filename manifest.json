@@ -4,9 +4,14 @@
   "name": "Cloud Drives",
   "version": "1.0.0",
   "author": "Jon",
+  "license": "MIT",
   "description": "rclone mount status, storage quota, and sign-in recovery for cloud drives",
-  "kinds": ["bar-widget"],
-  "entryPoints": { "barWidget": "Panel.qml" },
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
   "barWidget": {
     "displayName": "Cloud Drives",
     "description": "Mount health, storage quota, transfer activity and one-click sign-in recovery for every rclone mount.",
