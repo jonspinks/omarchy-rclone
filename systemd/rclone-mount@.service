@@ -1,0 +1,37 @@
+[Unit]
+# Template unit: the instance name is BOTH the rclone remote and the mount
+# directory under $HOME, so `rclone-mount@GDrive` mounts GDrive: on ~/GDrive.
+# Name the remotes in `rclone config` to match (GDrive, OneDrive-Work).
+# Renaming a remote later strands its running unit; see "Renaming or removing
+# a drive" in the README.
+Description=rclone mount for %i
+# Do NOT add Wants/After=network-online.target here. That is a *system* target;
+# in the user manager it resolves to nothing (LoadState=not-found), so it orders
+# against nothing while looking like a network gate. The restart loop below is
+# the real gate: rclone mount exits non-zero if it cannot reach the remote at
+# startup (for example before DNS is up), and systemd retries.
+AssertPathIsDirectory=%h/%i
+# Never give up retrying. Default is 5 starts / 10s, which RestartSec=10 only
+# skirts by accident -- a slower DNS bring-up would trip it and leave the mount
+# dead until noticed.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+# --vfs-cache-mode full is what makes ordinary apps (Nautilus previews, editors
+# doing read-modify-write) behave; the size/age caps keep it off the SSD.
+# --umask 077 keeps cloud files as private as the rest of $HOME.
+ExecStart=/usr/bin/rclone mount %i: %h/%i \
+  --vfs-cache-mode full \
+  --vfs-cache-max-size 5G \
+  --vfs-cache-max-age 24h \
+  --dir-cache-time 1h \
+  --poll-interval 1m \
+  --umask 077 \
+  --log-level INFO
+ExecStop=/usr/bin/fusermount3 -uz %h/%i
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

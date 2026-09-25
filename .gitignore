@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# Never commit rclone credentials or tokens, even by accident
+rclone.conf
+*.token
+*.bak
+*.bak.*

@@ -1,0 +1,754 @@
+#!/usr/bin/env python3
+"""Report the state of every rclone FUSE mount as one JSON object, for the
+blacksheep.rclone bar widget.
+
+Python rather than bash (the usual shape for scripts in this directory) because
+the payload is a list of records carrying free-text journal errors, and escaping
+those into JSON by hand in bash works right up until an error message contains a
+quote.
+
+WHAT IS HARD HERE
+
+Almost nothing about a FUSE cloud mount can be read from one place, and the
+obvious sources lie:
+
+  * `ActiveState=active` does not mean the mount works. A SIGSTOPped rclone still
+    reports active and still appears in /proc/mounts; only IO on the mountpoint
+    reveals it, which is why `responsive` costs a statfs with a hard timeout.
+  * `Result=success` + inactive/dead does not mean the user stopped it. systemd
+    records a failed AssertPathIsDirectory in AssertResult, leaving Result at
+    success -- so a mount that CANNOT start is byte-identical to one deliberately
+    stopped unless AssertResult is read. Telling someone they turned a drive off
+    when in fact it is broken is the one attribution a status widget must never
+    get wrong, so `blocked` is evaluated before `stopped`.
+  * A mount can be up, responsive and read-only, and every save to it fails
+    silently. /proc/mounts field 4 already carries rw/ro; throwing it away buys
+    nothing.
+  * `invalid_grant` means the OAuth refresh token is dead AND ALSO means the
+    system clock is wrong -- the same literal string for a fault the user must
+    fix and one that fixes itself. timedatectl separates them.
+
+STICKY AUTH, AND WHY
+
+An expired token puts the unit in a ~10s restart loop, and for the second or so
+after each restart the journal has not yet been written: a poll landing in that
+window sees no invalid_grant and reclassifies the remote from "sign-in expired"
+to "mount failing". That flip matters because it changes the remedy on offer
+from "sign in again" to "restart the mount" -- and restarting a token-dead mount
+can never work. So auth is latched in the state file once seen, and cleared only
+by evidence of health, never by its mere absence from one sample.
+
+The same reasoning drives `notify`: a state must hold for two consecutive polls
+before it is allowed to interrupt anyone. Without that, the flip above fires a
+critical desktop notification every twelve seconds, forever.
+
+UNITS ARE THE DRIVES, rclone.conf IS THE CROSS-CHECK
+
+A drive is a `rclone-mount@<Name>` unit, not a remote. The template uses %i as
+both the remote and the mount directory, so the two lists can disagree in ways
+that nothing else in the system reports:
+
+  * A remote with no unit. You ran `rclone config` and nothing else. It gets a
+    "Not set up" row with a one-click setup (mkdir, then enable --now). It stays
+    out of the aggregate, the badge and the notifications: an account you have
+    not mounted yet is not a fault.
+  * A unit whose remote is gone, usually because it was renamed in `rclone
+    config`. The running mount keeps working on the config it loaded, so every
+    other signal says "Up to date" until the next restart, and after that the
+    journal only shows a generic failure. "Remote missing" outranks every other
+    state, because Restart and Sign in cannot work without the remote.
+
+If `rclone listremotes` itself fails, neither check runs. Not being able to read
+the config does not show that a remote is missing.
+
+Exit status is always 0 with valid JSON on stdout; the widget must never have to
+reason about a failed helper.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+UNIT_PREFIX = "rclone-mount@"
+UNIT_SUFFIX = ".service"
+WANTS_DIR = os.path.join(HOME, ".config/systemd/user/default.target.wants")
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")),
+    "omarchy", "rclone-status",
+)
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+
+# `rclone about` is a network round trip (~0.4s healthy, and it hangs for a
+# while on a dead remote), so it is cached. The TTL is generous because quota
+# moves slowly -- but a *stale* reading is never allowed to raise a badge or an
+# interrupt, which is what QUOTA_TRUST_SEC enforces below.
+QUOTA_TTL_SEC = 900
+QUOTA_TRUST_SEC = 120
+# How long to leave an unreachable remote alone before asking it for quota again.
+QUOTA_FAIL_BACKOFF_SEC = 300
+QUOTA_WARN_PCT = 90
+QUOTA_FULL_PCT = 98
+
+# Free space on the local disk, not on the remote. With --vfs-cache-mode full a
+# full /home means writes to the mount fail and queued uploads cannot stage.
+DISK_WARN_BYTES = 2 * 1024 ** 3
+DISK_FAULT_BYTES = 512 * 1024 ** 2
+
+STATFS_TIMEOUT_SEC = 2
+# A cold mount is legitimately not-yet-mounted; do not call that a fault.
+START_GRACE_SEC = 30
+# Transient network trouble self-heals. Only escalate once it has persisted.
+TRANSIENT_GRACE_POLLS = 3
+
+AUTH_RE = re.compile(r"invalid_grant", re.I)
+THROTTLE_RE = re.compile(
+    r"userRateLimitExceeded|rateLimitExceeded|\b429\b|too many requests", re.I)
+TRANSIENT_RES = [
+    ("offline", re.compile(r"temporary failure in name resolution|no such host", re.I)),
+    ("refused", re.compile(r"connection (refused|reset)", re.I)),
+    ("timeout", re.compile(r"i/o timeout|context deadline exceeded", re.I)),
+    ("tls", re.compile(r"tls: |handshake failure|certificate", re.I)),
+    ("server", re.compile(r"\b5\d\d\b .*(error|unavailable)|internalError|backendError", re.I)),
+]
+
+
+def run(cmd, timeout=6):
+    """Never raise: a helper that throws is a widget that shows nothing."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except Exception:
+        return 1, "", ""
+
+
+def load_state(name):
+    try:
+        with open(os.path.join(STATE_DIR, "prev-%s.json" % name)) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(name, data):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        path = os.path.join(STATE_DIR, "prev-%s.json" % name)
+        tmp = "%s.tmp.%d" % (path, os.getpid())
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def instances():
+    """Enabled instances first, then anything else systemd has loaded.
+
+    Reading the .wants symlinks rather than only asking systemd means a remote
+    that is enabled but has never started still gets a row, instead of silently
+    vanishing from the panel.
+    """
+    found = []
+    try:
+        for n in sorted(os.listdir(WANTS_DIR)):
+            if n.startswith(UNIT_PREFIX) and n.endswith(UNIT_SUFFIX):
+                found.append(n)
+    except OSError:
+        pass
+    rc, out, _ = run(["systemctl", "--user", "list-units", "--all", "--no-legend",
+                      "--plain", UNIT_PREFIX + "*"])
+    if rc == 0:
+        for line in out.splitlines():
+            parts = line.split()
+            if parts and parts[0].startswith(UNIT_PREFIX) and parts[0].endswith(UNIT_SUFFIX):
+                found.append(parts[0])
+    seen, order = set(), []
+    for u in found:
+        if u not in seen:
+            seen.add(u)
+            order.append(u)
+    return order
+
+
+def configured_remotes():
+    """The remote names in rclone.conf, or None if rclone could not say.
+
+    `listremotes` leaves out any section that has no `type =` line. A remote
+    saved in that broken state (a real rclone config trap) therefore shows as
+    missing, which is accurate: nothing can mount it until the type is fixed.
+    """
+    rc, out, _ = run(["rclone", "listremotes"], timeout=4)
+    if rc != 0:
+        return None
+    return [l[:-1] for l in out.splitlines() if l.endswith(":") and len(l) > 1]
+
+
+# Names the template can mount as-is. Anything else (a space, say) systemd
+# escapes in %i, which gives a remote and a directory that no longer match
+# the name in rclone.conf. So the widget offers no one-click setup for those.
+SETUP_SAFE_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9_.-]*$")
+
+
+def remote_name(inst):
+    """The instance string IS the identity, deliberately left escaped.
+
+    The first version ran it through `systemd-escape --unescape --instance`,
+    which silently did nothing: that flag wants a fully qualified unit name and
+    rejects a bare instance, so rc was always 1 and the fallback returned the
+    input unchanged. Repairing the call would have been worse than leaving it
+    broken, because the unit uses %i verbatim for BOTH the rclone remote and
+    the mount directory -- decoding the name here would have produced a remote
+    and a path that the unit never uses. Escaped end to end is the only form
+    that stays true to what systemd actually mounts.
+    """
+    return inst
+
+
+def unit_props(unit):
+    keys = ["ActiveState", "SubState", "Result", "AssertResult", "ConditionResult",
+            "NRestarts", "ExecMainStatus", "StatusText", "InvocationID",
+            "ActiveEnterTimestampMonotonic", "InactiveExitTimestampMonotonic"]
+    rc, out, _ = run(["systemctl", "--user", "show", unit] + ["-p" + k for k in keys])
+    d = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            d[k] = v
+    return d
+
+
+def proc_mounts():
+    """mountpoint -> options string, for fuse.rclone mounts only."""
+    out = {}
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 4 and parts[2].startswith("fuse.rclone"):
+                    mp = parts[1].replace("\\040", " ").replace("\\011", "\t")
+                    out[mp] = parts[3]
+    except OSError:
+        pass
+    return out
+
+
+def dir_exists(path):
+    """`test -d` behind a hard timeout.
+
+    os.path.isdir() on a wedged FUSE mountpoint blocks in uninterruptible
+    kernel sleep and never returns -- which would hang the very poll whose job
+    is to detect that the mount is wedged, freezing the widget on stale data
+    forever. Same reasoning as responsive() below; same hammer.
+    """
+    try:
+        p = subprocess.run(
+            ["timeout", "-s", "KILL", str(STATFS_TIMEOUT_SEC), "test", "-d", path],
+            capture_output=True, timeout=STATFS_TIMEOUT_SEC + 2)
+        return p.returncode == 0
+    except Exception:
+        return False
+
+
+def responsive(path):
+    """True / False / None(unknown).
+
+    `stat -f` touches the filesystem; a wedged rclone never answers, so the
+    timeout is the entire point. SIGKILL because a stuck FUSE call ignores TERM.
+    """
+    try:
+        p = subprocess.run(
+            ["timeout", "-s", "KILL", str(STATFS_TIMEOUT_SEC), "stat", "-f", "--", path],
+            capture_output=True, text=True, timeout=STATFS_TIMEOUT_SEC + 2)
+        return p.returncode == 0
+    except Exception:
+        return None
+
+
+def journal_tail(unit, invocation=None, since="-15min", lines=300):
+    """Prefer the current invocation; fall back to a time window.
+
+    A flat 15-minute window reads errors from invocations that have already
+    been replaced as though they were current -- so a mount that has recovered
+    keeps reporting the fault that killed its predecessor. Scoping to the
+    running InvocationID fixes that; the auth latch (see latch_auth) is what
+    covers the opposite hazard, the ~1s after each restart where the current
+    invocation has not logged anything yet.
+    """
+    if invocation:
+        rc, out, _ = run(["journalctl", "--user",
+                          "_SYSTEMD_INVOCATION_ID=" + invocation,
+                          "-n", str(lines), "--no-pager", "-o", "cat"], timeout=8)
+        if rc == 0:
+            return out
+    rc, out, _ = run(["journalctl", "--user", "-u", unit, "--since", since,
+                      "-n", str(lines), "--no-pager", "-o", "cat"], timeout=8)
+    return out if rc == 0 else ""
+
+
+def disk_for(path):
+    try:
+        st = os.statvfs(path)
+        total = st.f_blocks * st.f_frsize
+        free = st.f_bavail * st.f_frsize
+        pct = round((total - free) / total * 100, 1) if total else 0.0
+        return {"freeBytes": free, "totalBytes": total, "pct": pct}
+    except Exception:
+        return None
+
+
+def clock_synced():
+    rc, out, _ = run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"], timeout=3)
+    if rc != 0 or not out:
+        return None
+    return out.strip() == "yes"
+
+
+def rc_socket(name):
+    sock = os.path.join(RUNTIME_DIR, "rclone-mount-%s.sock" % name)
+    return sock if os.path.exists(sock) else None
+
+
+def rc_call(sock, method, timeout=4):
+    rc, out, _ = run(["rclone", "rc", "--unix-socket", sock, method], timeout=timeout)
+    if rc != 0:
+        return None
+    try:
+        return json.loads(out)
+    except Exception:
+        return None
+
+
+def fetch_quota(name, prev, force=False):
+    """Cached `rclone about`. Returns the quota dict and whether it is fresh.
+
+    Skipped entirely for a remote we already believe is token-dead: the call
+    would just fail slowly and we would learn nothing we did not already know.
+    """
+    cached = prev.get("quota") or {}
+    age = time.time() - cached.get("at", 0) if cached.get("at") else None
+    if cached and not force and age is not None and age < QUOTA_TTL_SEC:
+        q = dict(cached)
+        q["ageSec"] = int(age)
+        return q
+    # Negative-cache a failure so an unreachable provider is not re-dialled on
+    # every 3s poll, each call burning its full 12s timeout.
+    failed_at = prev.get("quotaFailedAt")
+    if failed_at and (time.time() - failed_at) < QUOTA_FAIL_BACKOFF_SEC and cached:
+        q = dict(cached)
+        q["ageSec"] = int(age) if age is not None else None
+        q["stale"] = True
+        return q
+    rc, out, _ = run(["rclone", "about", name + ":", "--json"], timeout=12)
+    if rc != 0:
+        if cached:
+            q = dict(cached)
+            q["ageSec"] = int(age) if age is not None else None
+            q["stale"] = True
+            return q
+        return {"ok": False, "ageSec": None}
+    try:
+        d = json.loads(out)
+    except Exception:
+        return {"ok": False, "ageSec": None}
+    total = d.get("total")
+    free = d.get("free")
+    used = d.get("used")
+    # `free` already excludes the recycle bin (verified: total-used-free ==
+    # trashed exactly), so used/total under-reports by the bin. Charge the user
+    # for what the provider charges them for.
+    pct = round((total - free) / total * 100, 1) if total and free is not None else None
+    # `used` is NOT what the meter measures. `total - free` is everything the
+    # provider counts against the quota; the residual `total - used - free` is
+    # the recycle bin on OneDrive but "other" (Gmail, Photos) on Google Drive,
+    # where it can run to hundreds of GB while `trashed` is near zero. So a
+    # caption built from `used` could read "80 MiB of 2 TiB used (20%)" and
+    # contradict itself on screen. `consumed` is the figure the percentage derives from.
+    consumed = (total - free) if (total is not None and free is not None) else used
+    q = {"ok": True, "total": total, "used": used, "consumed": consumed, "free": free,
+         "trashed": d.get("trashed"), "pct": pct, "at": int(time.time()), "ageSec": 0}
+    return q
+
+
+def latch_auth(auth_now, prev_latched, healthy_now):
+    """Latch an expired sign-in on sight; release it only on evidence of health.
+
+    The absence of `invalid_grant` from one journal sample is NOT evidence that
+    the token is good: for about a second after each restart in the ~10s loop
+    the journal has not been written yet, and a poll landing there would clear
+    the latch, swap the offered remedy from "sign in again" to "restart" -- a
+    remedy that cannot work on a dead token -- and re-fire a critical
+    notification on the way back in. Only a mount that is actually up, mounted
+    and answering proves the credentials work.
+
+    A drive deliberately stopped while signed out therefore stays "sign-in
+    expired" rather than reverting to "stopped", which is the useful answer:
+    starting it again would only re-enter the loop.
+    """
+    if healthy_now:
+        return False
+    return bool(auth_now or prev_latched)
+
+
+def classify(r, prev, now_mono):
+    """Return (state, stateText, faultText, fixAction).
+
+    Order is precedence, and the order is the design. `blocked` outranks
+    `stopped` so a mount that cannot start is never reported as a user choice;
+    latched `auth` outranks `failed` so the remedy on offer stays the one that
+    can actually work.
+    """
+    name = r["name"]
+    unit_state = r["unitState"]
+    sub = r["subState"]
+    mounted = r["mounted"]
+
+    # Before auth: `config reconnect` on a remote that does not exist fails, so
+    # a latched "Sign in again" here would be the wrong remedy.
+    if r.get("remoteMissing"):
+        live = " It is still mounted from the old config, but will fail on its " \
+               "next restart." if (unit_state == "active" and mounted) else ""
+        return ("orphaned", "Remote missing",
+                "%s - rclone has no remote called %s: (renamed or deleted in "
+                "rclone config?).%s Move the mount to the new name, or disable "
+                "it; see the plugin README." % (name, name, live), "none")
+
+    if r["authLatched"]:
+        if r["clockSynced"] is False:
+            return ("clock", "Clock is wrong",
+                    "%s - the system clock is out of sync, so sign-in cannot be "
+                    "verified. This fixes itself once time syncs." % name, "wait")
+        return ("auth", "Sign-in expired",
+                "%s - sign-in expired. Retrying cannot fix this; rclone has "
+                "restarted %s times." % (name, "{:,}".format(r["restarts"])), "reconnect")
+
+    # AssertResult/ConditionResult read "no" on a unit that has simply never
+    # been started, so trusting them unconditionally reported a never-run mount
+    # as "Cannot start" with no remedy. They only carry a verdict once a start
+    # has actually been attempted, which InactiveExitTimestampMonotonic marks.
+    if r["everStarted"] and (r["assertResult"] == "no" or r["conditionResult"] == "no"):
+        if not r["dirExists"]:
+            return ("blocked", "Cannot start",
+                    "%s - %s is missing, so the mount cannot start." % (name, r["path"]),
+                    "mkdir")
+        return ("blocked", "Cannot start",
+                "%s - systemd refused to start the mount." % name, "none")
+
+    if unit_state == "active" and mounted:
+        if r["responsive"] is False:
+            return ("hung", "Not responding",
+                    "%s - mounted but not answering. Restart the mount." % name, "restart")
+        if r["readOnly"]:
+            # Restarting remounts it exactly as read-only, so offering Restart
+            # would be a remedy we know cannot work. This is a unit-flag fact.
+            return ("readonly", "Read-only",
+                    "%s - mounted read-only, so changes cannot be saved. Remove "
+                    "--read-only from the mount unit to fix this." % name, "none")
+        if r["throttled"]:
+            return ("throttled", "Throttled by provider", "", "wait")
+        return ("ok", "Up to date", "", "none")
+
+    if unit_state == "activating" and sub != "auto-restart":
+        return ("starting", "Starting", "", "wait")
+
+    if unit_state == "active" and not mounted:
+        # Type=notify, so active normally implies mounted; allow a grace window
+        # rather than flashing a fault during a cold start.
+        if r["activeForSec"] is not None and r["activeForSec"] < START_GRACE_SEC:
+            return ("starting", "Starting", "", "wait")
+        return ("failed", "Mount missing",
+                "%s - the service is running but %s is not mounted."
+                % (name, r["path"]), "restart")
+
+    if r["transientKind"] and r["transientPolls"] < TRANSIENT_GRACE_POLLS:
+        return ("starting", "Reconnecting", "", "wait")
+
+    if unit_state in ("activating", "failed") or sub == "auto-restart":
+        if r["transientKind"]:
+            return ("failed", "Cannot reach provider",
+                    "%s - cannot reach the provider (%s). Retrying."
+                    % (name, r["transientKind"]), "wait")
+        return ("failed", "Mount failing",
+                "%s - the mount keeps failing (restarted %s times)."
+                % (name, "{:,}".format(r["restarts"])), "restart")
+
+    if unit_state in ("inactive", "deactivating"):
+        return ("stopped", "Stopped", "", "start")
+
+    return ("unknown", "Unknown", "", "none")
+
+
+# Severity for the aggregate bar state. Higher wins. Every state the classifier
+# or main() can produce must appear here: a missing key falls through to the
+# .get() default and would take its precedence by accident rather than by
+# decision. "uploading" outranks the quiet states because it is the transient
+# one worth showing; "full" sits with the faults because it needs the user.
+RANK = {"ok": 0, "starting": 1, "throttled": 1, "stopped": 2, "unknown": 2,
+        "uploading": 3, "readonly": 5, "full": 6, "failed": 6, "hung": 7,
+        "blocked": 7, "clock": 8, "auth": 9, "orphaned": 10}
+FAULTS = {"readonly", "failed", "hung", "blocked", "clock", "auth", "full", "orphaned"}
+# "unconfigured" (a remote with no unit) is left out of RANK on purpose. Those
+# rows never take part in the aggregate; see main().
+
+
+def main():
+    poll = "--poll" in sys.argv
+    out = {"schema": 1, "rc": False, "remotes": [], "aggregate": "unknown",
+           "faulted": 0, "notify": None, "notifications": []}
+
+    synced = clock_synced()
+    out["clockSynced"] = synced
+
+    mounts = proc_mounts()
+    remotes_cfg = configured_remotes()
+    seen_names = set()
+
+    # A list, not a single slot: two drives can fault on the same poll, and
+    # the one that lost the race would never have notified at all.
+    notifications = []
+    any_rc = False
+
+    for unit in instances():
+        inst = unit[len(UNIT_PREFIX):-len(UNIT_SUFFIX)]
+        name = remote_name(inst)
+        seen_names.add(name)
+        path = os.path.join(HOME, name)
+        prev = load_state(name)
+        p = unit_props(unit)
+
+        opts = mounts.get(path)
+        mounted = opts is not None
+        read_only = bool(opts) and re.search(r"(^|,)ro(,|$)", opts) is not None
+
+        try:
+            restarts = int(p.get("NRestarts", "0") or 0)
+        except ValueError:
+            restarts = 0
+
+        active_for = None
+        try:
+            t = int(p.get("ActiveEnterTimestampMonotonic", "0") or 0)
+            if t:
+                # systemd's *Monotonic stamps are CLOCK_MONOTONIC, which stops
+                # across suspend; /proc/uptime is CLOCK_BOOTTIME, which does not.
+                # On this machine five s2idle suspends had already put them 37.5
+                # hours apart, so the start-grace window never once applied.
+                now_mono = time.clock_gettime(time.CLOCK_MONOTONIC)
+                active_for = max(0, now_mono - t / 1e6)
+        except Exception:
+            pass
+        try:
+            ever_started = int(p.get("InactiveExitTimestampMonotonic", "0") or 0) != 0
+        except ValueError:
+            ever_started = False
+
+        r = {
+            "name": name, "unit": unit, "path": path,
+            "unitState": p.get("ActiveState", ""), "subState": p.get("SubState", ""),
+            "result": p.get("Result", ""), "assertResult": p.get("AssertResult", ""),
+            "conditionResult": p.get("ConditionResult", ""),
+            "restarts": restarts, "statusText": p.get("StatusText", ""),
+            "dirExists": dir_exists(path),
+            "mounted": mounted, "readOnly": read_only,
+            "responsive": responsive(path) if mounted else None,
+            "activeForSec": active_for, "clockSynced": synced,
+            "everStarted": ever_started,
+            "remoteMissing": remotes_cfg is not None and name not in remotes_cfg,
+        }
+
+        jr = journal_tail(unit, p.get("InvocationID") or None)
+        auth_now = bool(AUTH_RE.search(jr))
+        r["throttled"] = bool(THROTTLE_RE.search(jr))
+        kind = None
+        for label, rx in TRANSIENT_RES:
+            if rx.search(jr):
+                kind = label
+                break
+        r["transientKind"] = kind
+        r["transientPolls"] = (prev.get("transientPolls", 0) + 1) if kind else 0
+
+        healthy_now = (r["unitState"] == "active" and mounted and r["responsive"] is True)
+        r["authLatched"] = latch_auth(auth_now, prev.get("authLatched", False), healthy_now)
+
+        state, text, fault, fix = classify(r, prev, None)
+
+        # Only force a fresh reading where one could change the verdict. A remote
+        # that cannot reach its provider cannot answer `about` either.
+        force_quota = state in ("readonly", "full")
+        if state in ("auth", "clock", "blocked", "stopped", "orphaned"):
+            q = (prev.get("quota") or {})
+            if q and q.get("at"):
+                q = dict(q)
+                age = time.time() - q["at"]
+                q["ageSec"] = int(age)
+                q["stale"] = age > QUOTA_TRUST_SEC
+            elif q:
+                # A persisted failure is not a reading; it has no age.
+                q = {"ok": False, "ageSec": None}
+            else:
+                q = {"ok": False, "ageSec": None}
+        else:
+            q = fetch_quota(name, prev, force=force_quota)
+            if q.get("ok") and q.get("pct") is not None and q["pct"] >= QUOTA_WARN_PCT \
+                    and (q.get("ageSec") or 0) > QUOTA_TRUST_SEC:
+                q = fetch_quota(name, prev, force=True)
+
+        fresh = q.get("ok") and (q.get("ageSec") is not None) and q["ageSec"] <= QUOTA_TRUST_SEC
+        # A badge from a fifteen-minute-old number is a lie either way it points,
+        # so only a reading we have just taken is allowed to escalate.
+        if fresh and q.get("pct") is not None and q["pct"] >= QUOTA_FULL_PCT and state == "ok":
+            state, text = "full", "Storage full"
+            fault = "%s - storage is full (%s%% of quota used); uploads will fail." % (
+                name, q["pct"])
+            fix = "none"
+        r["quota"] = q
+
+        sock = rc_socket(name)
+        if sock:
+            # A socket inode proves nothing: rclone can be wedged or gone and
+            # leave it behind. rc is "on" only once something answers.
+            stats = rc_call(sock, "core/stats")
+            if stats is None:
+                sock = None
+        if sock:
+            any_rc = True
+            vfs = rc_call(sock, "vfs/stats")
+            # bwlimit cannot change without someone setting it, and it resets on
+            # restart -- so re-read it only when the mount has been restarted.
+            inv = p.get("InvocationID") or ""
+            if prev.get("bwInvocation") == inv and prev.get("bwlimit"):
+                bw = prev["bwlimit"]
+            else:
+                bw = rc_call(sock, "core/bwlimit")
+            if stats:
+                # NOTE: `speed` here is a session-wide average, and `transferring`
+                # stays empty for VFS cache uploads -- rclone only populates it
+                # for sync/copy operations (verified live against a real mount
+                # upload). So there is no honest per-upload throughput to show
+                # for a mount, and the panel deliberately shows counts instead of
+                # a speed that would read as current when it is not.
+                r["transfer"] = {
+                    "sessionAvgSpeed": stats.get("speed"),
+                    "errors": stats.get("errors"), "retryError": stats.get("retryError"),
+                    "fatalError": stats.get("fatalError"),
+                    "lastError": stats.get("lastError", ""),
+                }
+            if vfs and isinstance(vfs.get("diskCache"), dict):
+                dc = vfs["diskCache"]
+                r["cache"] = {
+                    "bytesUsed": dc.get("bytesUsed"), "files": dc.get("files"),
+                    "erroredFiles": dc.get("erroredFiles"),
+                    "outOfSpace": dc.get("outOfSpace"),
+                    "uploadsInProgress": dc.get("uploadsInProgress"),
+                    "uploadsQueued": dc.get("uploadsQueued"),
+                    "path": dc.get("path"),
+                }
+            if bw:
+                r["bwlimit"] = {"rate": bw.get("rate"),
+                                "rx": bw.get("bytesPerSecondRx"),
+                                "tx": bw.get("bytesPerSecondTx")}
+        r["rc"] = bool(sock)
+
+        # Queued and in-progress are both the "uploading" state, differing only
+        # in wording. Leaving a queued upload as state "ok" made the row say
+        # "Upload queued" while the hero above it said "all drives up to date".
+        if state == "ok" and r.get("cache"):
+            c = r["cache"]
+            if c.get("uploadsInProgress"):
+                state, text = "uploading", "Uploading"
+            elif c.get("uploadsQueued"):
+                state, text = "uploading", "Upload queued"
+
+        r["state"], r["stateText"], r["faultText"], r["fixAction"] = state, text, fault, fix
+
+        # Two consecutive polls at the same state before it may interrupt anyone.
+        held = prev.get("pendingState") == state
+        stable = prev.get("stableState")
+        if held and stable != state:
+            if state in FAULTS:
+                notifications.append({
+                    "remote": name, "state": state,
+                    "headline": "%s - %s" % (name, text),
+                    "body": fault or text,
+                    # Not critical when orphaned: the mount usually still works,
+                    # so the user has until the next reboot to move it.
+                    "urgency": "critical" if state in ("auth", "hung", "blocked", "full") else "normal",
+                    "fixAction": fix,
+                })
+            stable = state
+        elif not held:
+            pass
+        else:
+            stable = stable or state
+
+        if poll:
+            # Never let a failed reading overwrite a good one: keep the last
+            # successful quota and mark freshness separately.
+            good = r["quota"] if (r["quota"] or {}).get("at") else (prev.get("quota") or {})
+            st = {
+                "authLatched": r["authLatched"],
+                "transientPolls": r["transientPolls"],
+                "quota": {k: v for k, v in (good or {}).items()
+                          if k in ("ok", "total", "used", "consumed", "free", "trashed", "pct", "at")},
+                "pendingState": state,
+                "stableState": stable if held else prev.get("stableState"),
+            }
+            if (r["quota"] or {}).get("ok"):
+                st["quotaFailedAt"] = None
+            elif prev.get("quotaFailedAt"):
+                st["quotaFailedAt"] = prev["quotaFailedAt"]
+            else:
+                st["quotaFailedAt"] = int(time.time())
+            if r.get("bwlimit"):
+                st["bwlimit"] = r["bwlimit"]
+                st["bwInvocation"] = p.get("InvocationID") or ""
+            save_state(name, st)
+
+        out["remotes"].append(r)
+
+    # Remotes with no unit, after the real drives. They carry no unit state,
+    # quota or rc, and write no state file: nothing is running that could
+    # have changed since the last poll.
+    for name in (remotes_cfg or []):
+        if name in seen_names:
+            continue
+        path = os.path.join(HOME, name)
+        safe = SETUP_SAFE_RE.match(name) is not None
+        out["remotes"].append({
+            "name": name, "unit": UNIT_PREFIX + name + UNIT_SUFFIX, "path": path,
+            "unitState": "", "subState": "", "mounted": False, "responsive": None,
+            "readOnly": False, "restarts": 0, "rc": False,
+            "quota": {"ok": False, "ageSec": None},
+            "state": "unconfigured",
+            "stateText": "Not set up" if safe else "Not set up \u2014 rename to mount",
+            "faultText": "", "fixAction": "setup" if safe else "none",
+            "setupNote": "" if safe else
+                "Rename this remote to letters, digits, '.', '_' or '-' to mount it.",
+        })
+
+    out["rc"] = any_rc
+    out["notifications"] = notifications
+    # Kept for anything reading the old single-slot field.
+    out["notify"] = notifications[0] if notifications else None
+    cache_root = os.path.join(
+        os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "rclone")
+    out["disk"] = disk_for(cache_root if os.path.isdir(cache_root) else HOME)
+    if out["disk"]:
+        out["disk"]["low"] = out["disk"]["freeBytes"] < DISK_WARN_BYTES
+        out["disk"]["critical"] = out["disk"]["freeBytes"] < DISK_FAULT_BYTES
+
+    drives = [r for r in out["remotes"] if r["state"] != "unconfigured"]
+    states = [r["state"] for r in drives]
+    out["faulted"] = sum(1 for s in states if s in FAULTS)
+    out["aggregate"] = max(states, key=lambda s: RANK.get(s, 3)) if states else "unknown"
+    out["mountedCount"] = sum(1 for r in drives if r["mounted"])
+    out["total"] = len(drives)
+    out["unconfigured"] = len(out["remotes"]) - len(drives)
+    print(json.dumps(out))
+
+
+if __name__ == "__main__":
+    main()
