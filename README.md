@@ -1,11 +1,49 @@
 # Cloud Drives — an Omarchy bar widget for rclone mounts
 
-Mount health, storage quota and sign-in recovery for every `rclone-mount@`
-systemd user unit, in the shape the OneDrive and Google Drive desktop clients
-use: a cloud in the bar that only draws attention when something is wrong, and
-a panel that names the problem and offers the one remedy that can fix it.
+Your cloud drives, right in the bar. Google Drive, OneDrive, Dropbox, or
+anything else rclone can mount, shown the way the OneDrive and Google Drive
+desktop apps do it.
 
-![The Cloud Drives panel, with one drive uploading](preview.png)
+![Cloud Drives: a quiet cloud in the bar, and a panel showing every drive's health and space](preview.png)
+
+## What you get
+
+rclone is brilliant at mounting cloud storage as ordinary folders. It's much
+less good at telling you when something's quietly gone wrong: a drive that
+signed itself out, uploads that stalled, a disk filling up with cache.
+Cloud Drives keeps an eye on all of that and tells you in plain words.
+
+**A quiet cloud in the bar.** It sits there looking like everything else on
+your bar. A little arrow appears inside it while something's uploading, and it
+only changes shape or gets a badge when a drive actually needs you.
+
+![The cloud in the bar: syncing, and needing you](screenshots/1-the-cloud.png)
+
+**Every drive at a glance.** Click it for each drive's state, and how much of
+your storage it's using, with the recycle bin counted properly. You also see
+the free space on *this* computer, which is the number that runs out first
+when rclone keeps a local cache.
+
+![All drives healthy, one uploading with three files queued](screenshots/2-syncing.png)
+
+**It tells you what's wrong, and fixes it in one click.** Each problem comes
+with the one thing that will actually help. Signed out? **Sign in** opens the
+sign-in for you, having safely paused that drive first. Stuck? **Restart**.
+Missing its folder? It makes it.
+
+![A drive whose sign-in expired, with the one-click fix](screenshots/3-sign-in.png)
+
+**Adding a drive is one click too.** Set up a new remote in rclone, and it
+shows up here, ready to mount.
+
+![A new remote, ready to set up](screenshots/4-set-up.png)
+
+**Nothing scary.** It only ever touches the `rclone-mount@` units it ships, and
+never your rclone config or its sign-in tokens. It needs no sudo, and has
+nothing system-wide.
+
+**Works with** any remote rclone can mount. It's built and used daily with
+Google Drive and OneDrive.
 
 ## What it shows
 
