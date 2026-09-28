@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -B
 """Report the state of every rclone FUSE mount as one JSON object, for the
 blacksheep.rclone bar widget.
 
@@ -68,7 +68,10 @@ reason about a failed helper.
 import json
 import os
 import re
+import selectors
+import stat
 import subprocess
+import tempfile
 import sys
 import time
 
@@ -116,33 +119,114 @@ TRANSIENT_RES = [
 ]
 
 
-def run(cmd, timeout=6):
-    """Never raise: a helper that throws is a widget that shows nothing."""
+# No command we run says more than a few kilobytes (journalctl is asked for
+# at most 300 lines); anything past this is cut off and the command killed,
+# so a runaway one can't exhaust the poll.
+MAX_OUTPUT = 4 * 1024 * 1024
+
+
+def run(cmd, timeout=6, limit=MAX_OUTPUT):
+    """Never raise: a helper that throws is a widget that shows nothing.
+
+    Output is read to a cap within the timeout; a command that goes past
+    either is killed and counts as failed.
+    """
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return p.returncode, p.stdout.strip(), p.stderr.strip()
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except Exception:
         return 1, "", ""
+    out, err, size = [], [], 0
+    end = time.monotonic() + timeout
+    sel = selectors.DefaultSelector()
+    sel.register(p.stdout, selectors.EVENT_READ, out)
+    sel.register(p.stderr, selectors.EVENT_READ, err)
+    try:
+        while sel.get_map():
+            left = end - time.monotonic()
+            if left <= 0 or size > limit:
+                p.kill()
+                p.wait()
+                return 1, "", ""
+            for key, _ in sel.select(left):
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    sel.unregister(key.fileobj)
+                    continue
+                size += len(chunk)
+                key.data.append(chunk)
+        rc = p.wait(max(0.1, end - time.monotonic()))
+    except Exception:
+        p.kill()
+        p.wait()
+        return 1, "", ""
+    finally:
+        sel.close()
+        p.stdout.close()
+        p.stderr.close()
+    text = lambda parts: b"".join(parts).decode(errors="replace").strip()
+    return rc, text(out), text(err)
+
+
+def state_dir():
+    """STATE_DIR as a 0700 directory of ours, never a symlink; else None."""
+    try:
+        os.makedirs(os.path.dirname(STATE_DIR), exist_ok=True)
+        try:
+            os.mkdir(STATE_DIR, 0o700)
+        except FileExistsError:
+            pass
+        st = os.lstat(STATE_DIR)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            return None
+        if st.st_mode & 0o077:
+            os.chmod(STATE_DIR, 0o700)
+        return STATE_DIR
+    except OSError:
+        return None
 
 
 def load_state(name):
+    """The last poll's state: a regular file of ours, read to a cap, or {}.
+
+    O_NOFOLLOW and O_NONBLOCK so a symlink or FIFO at the path is refused,
+    not followed or waited on.
+    """
+    d = state_dir()
+    if not d:
+        return {}
     try:
-        with open(os.path.join(STATE_DIR, "prev-%s.json" % name)) as f:
-            return json.load(f)
+        fd = os.open(os.path.join(d, "prev-%s.json" % name), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return {}
+    try:
+        with os.fdopen(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                return {}
+            raw = f.read(1024 * 1024 + 1)
+        return json.loads(raw) if len(raw) <= 1024 * 1024 else {}
     except Exception:
         return {}
 
 
 def save_state(name, data):
+    """Atomically, through a fresh private file (mkstemp) beside the target."""
+    d = state_dir()
+    if not d:
+        return
+    path = os.path.join(d, "prev-%s.json" % name)
     try:
-        os.makedirs(STATE_DIR, exist_ok=True)
-        path = os.path.join(STATE_DIR, "prev-%s.json" % name)
-        tmp = "%s.tmp.%d" % (path, os.getpid())
-        with open(tmp, "w") as f:
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".prev-%s." % name, suffix=".tmp")
+    except OSError:
+        return
+    try:
+        with os.fdopen(fd, "w") as f:
             json.dump(data, f)
         os.replace(tmp, path)
     except Exception:
-        pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def instances():
